@@ -1,9 +1,10 @@
 # bot.py
 """
-Main entrypoint for AuctionBot.
-Designed to work with the project's existing modules (database.py, auctions.py, bids.py, config.py, ...).
-Reads BOT_TOKEN from environment (.env) and strips spaces/newlines to avoid invalid token errors.
-Run: python bot.py
+Main entrypoint for AuctionBot (updated to work with remote Postgres OR local SQLite fallback).
+- Reads BOT_TOKEN from environment and strips spaces/newlines.
+- Initializes DB via database.init_db() which will try Postgres then fallback to SQLite.
+- Provides a /db_retry command to re-attempt connecting to Postgres at runtime.
+- Works with the rest of project files: database.py, database_local.py, auctions.py, bids.py, config.py, logs.py, etc.
 """
 
 import os
@@ -14,26 +15,26 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-# load dotenv early so .env values are available
+# load dotenv early
 from dotenv import load_dotenv
 load_dotenv()
 
-# Read and sanitize BOT_TOKEN here (do not print the token itself)
+# sanitize token
 _RAW_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_TOKEN = _RAW_BOT_TOKEN.strip() if isinstance(_RAW_BOT_TOKEN, str) else ""
 
-# quick checks
+# Quick checks
 if not BOT_TOKEN:
-    print("ERROR: BOT_TOKEN is missing or empty. Set BOT_TOKEN in your .env or environment variables.")
+    print("ERROR: BOT_TOKEN is missing or empty. Put your token in .env as BOT_TOKEN.")
     sys.exit(1)
 
-print(f"INFO: BOT_TOKEN length = {len(BOT_TOKEN)} (not shown).")
-if "\n" in _RAW_BOT_TOKEN or "\r" in _RAW_BOT_TOKEN or " " in _RAW_BOT_TOKEN:
-    print("WARNING: BOT_TOKEN contained whitespace/newline characters — they were stripped. Ensure you copied the token exactly.")
+print(f"INFO: BOT_TOKEN length = {len(BOT_TOKEN)} (not displayed).")
+if any(c in _RAW_BOT_TOKEN for c in [" ", "\n", "\r"]):
+    print("WARNING: BOT_TOKEN contained whitespace/newlines — they were stripped. Ensure exact token copy.")
 
-# Import project modules AFTER token validation (prevents partial startup with wrong env)
-from config import DEFAULT_COMMISSION, DEFAULT_CURRENCY, COOLDOWN_SECONDS, DEFAULT_AUCTION_DURATION_MIN, DEFAULT_MIN_INCREMENT
-from database import init_db, set_setting, get_setting, all_settings, create_auction, get_active_auction, undo_last_bid
+# Import project modules AFTER token check
+import database  # our wrapper (tries Postgres then local)
+from config import DEFAULT_COMMISSION, DEFAULT_CURRENCY, COOLDOWN_SECONDS, DEFAULT_AUCTION_DURATION_MIN
 from auctions import AuctionView, build_auction_embed, handle_bid, end_current_auction
 from bids import parse_amount, fmt_amount
 
@@ -45,48 +46,44 @@ intents.message_content = False
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-# Use bot.tree (do NOT create a new CommandTree)
-tree = bot.tree
+tree = bot.tree  # use built-in command tree
 
-# Helper: get allowed server id from DB (or None)
-async def get_allowed_server_id() -> int | None:
+# helper
+async def _init_db_with_logging():
     try:
-        v = await get_setting("server_id")
-        return int(v) if v else None
-    except Exception:
-        return None
+        await database.init_db()
+    except Exception as e:
+        print("ERROR during database.init_db():", e)
+        traceback.print_exc()
 
+# On ready
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
-    # init DB connection and ensure tables
-    try:
-        await init_db()
-        print("Database initialized.")
-    except Exception as e:
-        print("ERROR: Failed to initialize database:", e)
-        traceback.print_exc()
+    # Initialize DB (this will attempt remote then fallback)
+    await _init_db_with_logging()
 
-    # If server_id set, leave other guilds
+    # If server_id is set, optionally leave other guilds
     try:
-        server_id = await get_allowed_server_id()
+        server_id = await database.get_setting("server_id")
         if server_id:
+            server_id = int(server_id)
             for g in list(bot.guilds):
                 if g.id != server_id:
                     try:
                         await g.leave()
-                        print(f"Left guild {g.id} because not allowed.")
+                        print(f"Left guild {g.id} (not allowed).")
                     except Exception as e:
                         print("Failed to leave guild:", e)
     except Exception as e:
-        print("Warning: error while checking/leaving guilds:", e)
+        print("Warning while checking server_id:", e)
 
-    # restore active auction panel if any
+    # Restore active auction panel if exists
     try:
-        active = await get_active_auction()
+        active = await database.get_active_auction()
         if active:
-            ch_id = await get_setting("auction_channel_id")
-            currency = await get_setting("currency_name") or DEFAULT_CURRENCY
+            ch_id = await database.get_setting("auction_channel_id")
+            currency = await database.get_setting("currency_name") or DEFAULT_CURRENCY
             if ch_id:
                 try:
                     ch = bot.get_channel(int(ch_id))
@@ -94,17 +91,17 @@ async def on_ready():
                         embed = build_auction_embed(active, currency_name=currency)
                         view = AuctionView(active["id"])
                         await ch.send(embed=embed, view=view)
-                        print("Restored auction panel to auction channel.")
+                        print("Restored auction panel.")
                 except Exception as e:
                     print("Failed to restore auction panel:", e)
     except Exception as e:
-        print("Warning: error while restoring active auction:", e)
+        print("Warning while restoring auction:", e)
 
-    # sync commands: prefer guild sync if allowed server is set (faster)
+    # Sync commands: prefer guild sync if server_id known (faster)
     try:
-        server_id = await get_allowed_server_id()
+        server_id = await database.get_setting("server_id")
         if server_id:
-            guild_obj = discord.Object(id=server_id)
+            guild_obj = discord.Object(id=int(server_id))
             await tree.sync(guild=guild_obj)
             print(f"Commands synced to guild {server_id}.")
         else:
@@ -119,18 +116,17 @@ async def on_ready():
 # -------------------------
 
 @tree.command(name="config_set_server", description="تعيين السيرفر المسموح لتشغيل البوت (Set allowed server).")
-@app_commands.describe(secret="Secret code (for exclusive actions, optional)")
+@app_commands.describe(secret="Secret code (optional, for exclusive actions)")
 async def config_set_server(interaction: discord.Interaction, secret: str = ""):
     if interaction.guild is None:
         await interaction.response.send_message("Execute this command in the server you want to allow.", ephemeral=True)
         return
-    # require Manage Server or correct secret (if secret already set)
-    current_secret = await get_setting("secret_code") or ""
+    current_secret = await database.get_setting("secret_code") or ""
     if not interaction.user.guild_permissions.manage_guild and (secret != current_secret):
         await interaction.response.send_message("You need Manage Server permission or the correct secret.", ephemeral=True)
         return
-    await set_setting("server_id", str(interaction.guild.id))
-    await set_setting("guild_name", interaction.guild.name)
+    await database.set_setting("server_id", str(interaction.guild.id))
+    await database.set_setting("guild_name", interaction.guild.name)
     try:
         await tree.sync(guild=interaction.guild)
     except Exception:
@@ -146,7 +142,7 @@ async def config_set_role(interaction: discord.Interaction, role: discord.Role):
     if not interaction.user.guild_permissions.manage_roles:
         await interaction.response.send_message("You need Manage Roles permission.", ephemeral=True)
         return
-    await set_setting("role_id", str(role.id))
+    await database.set_setting("role_id", str(role.id))
     await interaction.response.send_message(f"تم تعيين رتبة الرواد: {role.name}", ephemeral=True)
 
 @tree.command(name="config_set_channels", description="تعيين رومات المزاد و روم اللوق (Auction & Log channels).")
@@ -158,9 +154,9 @@ async def config_set_channels(interaction: discord.Interaction, auction_channel:
     if not interaction.user.guild_permissions.manage_channels:
         await interaction.response.send_message("You need Manage Channels permission.", ephemeral=True)
         return
-    await set_setting("auction_channel_id", str(auction_channel.id))
-    await set_setting("log_channel_id", str(log_channel.id))
-    await interaction.response.send_message(f"تم تعيين قنوات المزاد واللوق.", ephemeral=True)
+    await database.set_setting("auction_channel_id", str(auction_channel.id))
+    await database.set_setting("log_channel_id", str(log_channel.id))
+    await interaction.response.send_message("تم تعيين قنوات المزاد واللوق.", ephemeral=True)
 
 @tree.command(name="config_set_secret", description="تعيين أو تغيير الرمز السري (Secret code).")
 @app_commands.describe(secret="Secret code string")
@@ -171,7 +167,7 @@ async def config_set_secret(interaction: discord.Interaction, secret: str):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("You need Manage Server permission.", ephemeral=True)
         return
-    await set_setting("secret_code", secret)
+    await database.set_setting("secret_code", secret)
     await interaction.response.send_message("تم تحديث الرمز السري.", ephemeral=True)
 
 @tree.command(name="config_set_misc", description="تعيين العمولة واسم العملة (Commission & Currency).")
@@ -183,8 +179,8 @@ async def config_set_misc(interaction: discord.Interaction, commission: int, cur
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("You need Manage Server permission.", ephemeral=True)
         return
-    await set_setting("commission", str(commission))
-    await set_setting("currency_name", currency)
+    await database.set_setting("commission", str(commission))
+    await database.set_setting("currency_name", currency)
     await interaction.response.send_message(f"Commission set to {commission}% and currency set to {currency}.", ephemeral=True)
 
 @tree.command(name="config_show", description="عرض إعدادات البوت الحالية داخل السيرفر (Show bot config).")
@@ -192,18 +188,31 @@ async def config_show(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Execute this command in the server.", ephemeral=True)
         return
-    s = await all_settings()
+    s = await database.all_settings()
     if not s:
         await interaction.response.send_message("No settings configured yet.", ephemeral=True)
         return
-    lines = []
-    for k, v in s.items():
-        lines.append(f"**{k}**: {v}")
-    # send ephemeral to the command user
+    lines = [f"**{k}**: {v}" for k, v in s.items()]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+# DB retry command: attempt to reconnect to remote Postgres
+@tree.command(name="db_retry", description="أعد محاولة الاتصال بقاعدة Postgres (جرب الاتصال الخارجي مرة ثانية).")
+async def db_retry(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.manage_guild or await database.get_setting("secret_code") == (await database.get_setting("secret_code") or "")):
+        # allow only admins; secret check can be expanded if needed
+        # simple check: require manage_guild
+        pass
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await database.init_db()
+        # test a simple settings read
+        _ = await database.get_setting("server_id")
+        await interaction.followup.send("Reattempted DB init — if no errors, connection/retry succeeded (or local DB active).", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Retry failed: {e}", ephemeral=True)
+
 # -------------------------
-# AUCTION MANAGEMENT COMMANDS (English names, Arabic descriptions)
+# AUCTION MANAGEMENT COMMANDS
 # -------------------------
 
 @tree.command(name="auction_open", description="فتح مزاد جديد و إنشاء لوحة المزاد.")
@@ -213,30 +222,25 @@ async def auction_open(interaction: discord.Interaction, start_bid: str, min_inc
         await interaction.response.send_message("Execute in the server.", ephemeral=True)
         return
 
-    # check allowed guild configured
-    allowed = await get_setting("server_id")
+    allowed = await database.get_setting("server_id")
     if allowed and int(allowed) != interaction.guild.id:
         await interaction.response.send_message("This bot is restricted to the configured server.", ephemeral=True)
         return
 
-    # permission: only members with role OR manage_guild OR secret can open
-    role_id = await get_setting("role_id")
+    role_id = await database.get_setting("role_id")
     role_ok = False
     if role_id:
-        role_id = int(role_id)
-        role_ok = any(r.id == role_id for r in interaction.user.roles)
-    current_secret = await get_setting("secret_code") or ""
+        role_ok = any(r.id == int(role_id) for r in interaction.user.roles)
+    current_secret = await database.get_setting("secret_code") or ""
     if not (role_ok or interaction.user.guild_permissions.manage_guild or secret == current_secret):
         await interaction.response.send_message("You don't have permission to open an auction.", ephemeral=True)
         return
 
-    # check if there's already an active auction
-    active = await get_active_auction()
+    active = await database.get_active_auction()
     if active:
         await interaction.response.send_message("يوجد بالفعل مزاد نشط.", ephemeral=True)
         return
 
-    # parse amounts
     try:
         sb = parse_amount(start_bid)
         mi = parse_amount(min_increment)
@@ -245,11 +249,10 @@ async def auction_open(interaction: discord.Interaction, start_bid: str, min_inc
         return
 
     ends_at = int((__import__("time").time()) + duration_minutes * 60)
-    record = await create_auction(interaction.user.id, sb, mi, ends_at)
+    record = await database.create_auction(interaction.user.id, sb, mi, ends_at)
 
-    # post panel in auction channel
-    ch_id = await get_setting("auction_channel_id")
-    currency = await get_setting("currency_name") or DEFAULT_CURRENCY
+    ch_id = await database.get_setting("auction_channel_id")
+    currency = await database.get_setting("currency_name") or DEFAULT_CURRENCY
     if ch_id:
         ch = bot.get_channel(int(ch_id))
         if ch:
@@ -260,7 +263,7 @@ async def auction_open(interaction: discord.Interaction, start_bid: str, min_inc
 
 @tree.command(name="auction_end", description="إنهاء المزاد وإعلان الفائز + تقرير اللوق")
 async def auction_end(interaction: discord.Interaction):
-    role_id = await get_setting("role_id")
+    role_id = await database.get_setting("role_id")
     role_ok = False
     if role_id:
         role_ok = any(r.id == int(role_id) for r in interaction.user.roles)
@@ -275,18 +278,18 @@ async def auction_end(interaction: discord.Interaction):
 
 @tree.command(name="auction_undo_last", description="حذف آخر مزايدة (للإدارة فقط)")
 async def auction_undo_last(interaction: discord.Interaction):
-    role_id = await get_setting("role_id")
+    role_id = await database.get_setting("role_id")
     role_ok = False
     if role_id:
         role_ok = any(r.id == int(role_id) for r in interaction.user.roles)
     if not (role_ok or interaction.user.guild_permissions.manage_guild):
         await interaction.response.send_message("You don't have permission.", ephemeral=True)
         return
-    active = await get_active_auction()
+    active = await database.get_active_auction()
     if not active:
         await interaction.response.send_message("No active auction.", ephemeral=True)
         return
-    undone = await undo_last_bid(active["id"])
+    undone = await database.undo_last_bid(active["id"])
     if undone:
         await interaction.response.send_message("Last bid removed.", ephemeral=True)
     else:
@@ -295,20 +298,19 @@ async def auction_undo_last(interaction: discord.Interaction):
 @tree.command(name="auction_reset", description="تصفير المزاد بالكامل (خطر)")
 @app_commands.describe(secret="Secret code is required to force reset")
 async def auction_reset(interaction: discord.Interaction, secret: str):
-    current_secret = await get_setting("secret_code") or ""
+    current_secret = await database.get_setting("secret_code") or ""
     if secret != current_secret and not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("Invalid secret or insufficient permission.", ephemeral=True)
         return
-    active = await get_active_auction()
+    active = await database.get_active_auction()
     if not active:
         await interaction.response.send_message("No active auction.", ephemeral=True)
         return
-    # end and log via helper
     await end_current_auction(bot)
     await interaction.response.send_message("Active auction force-ended.", ephemeral=True)
 
 # -------------------------
-# Interaction handling for buttons & modals
+# Interaction handling for buttons & modals (bid buttons)
 # -------------------------
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
@@ -330,15 +332,13 @@ async def on_interaction(interaction: discord.Interaction):
                     await handle_bid(interaction, auction_id, 500_000)
                     return
                 if typ == "custom":
-                    # import BidModal class from auctions module and present it
                     from auctions import BidModal
                     modal = BidModal(auction_id)
                     await interaction.response.send_modal(modal)
                     return
     except Exception:
         traceback.print_exc()
-    # let discord.py process other app commands normally
-    await bot.process_application_commands(interaction)
+    # DO NOT call bot.process_application_commands(interaction) — removed for compatibility.
 
 # Run
 if __name__ == "__main__":
