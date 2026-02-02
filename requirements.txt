@@ -1,4 +1,20 @@
-discord.py>=2.3.0
-asyncpg>=0.27.0
-aiosqlite>=0.17.0
+# requirements.txt
+# AuctionBot Dependencies
+# Python 3.10+ recommended
+
+# Discord Bot Framework
+discord.py>=2.3.2
+
+# Database - PostgreSQL
+asyncpg>=0.29.0
+
+# Database - SQLite (fallback)
+aiosqlite>=0.19.0
+
+# Environment Variables
 python-dotenv>=1.0.0
+
+# Optional but recommended for production
+# Uncomment if needed:
+# uvloop>=0.19.0  # For better async performance on Linux/macOS
+# aiodns>=3.1.0   # For faster DNS resolution
