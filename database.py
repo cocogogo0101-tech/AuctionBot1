@@ -6,39 +6,35 @@ Exports same async functions used by the bot.
 """
 
 import os
-import time
 import traceback
-import asyncio
+import importlib
+import time
 from typing import Optional, Dict, Any, List
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
-# runtime state
-_pool = None  # asyncpg.Pool when connected
+_pool = None  # asyncpg pool
 _using_local = False
 _local_module = None
 
-# lazy import of asyncpg to avoid import error if not installed
 async def _try_connect_postgres():
     global _pool, _using_local
     try:
         import asyncpg
     except Exception as e:
-        print("asyncpg not installed or import failed:", e)
+        print("asyncpg import failed:", e)
+        _using_local = True
+        return False
+
+    if not DATABASE_url_ok(DATABASE_URL):
+        print("DATABASE_URL invalid or empty; will use local DB.")
         _using_local = True
         return False
 
     try:
-        # allow DATABASE_URL to be empty -> fallback
-        if not DATABASE_URL:
-            print("DATABASE_URL empty: will use local DB.")
-            _using_local = True
-            return False
-
         print("Attempting to connect to remote Postgres...")
-        # create pool
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        # ensure settings table exists (create if not)
+        # ensure tables exist
         async with _pool.acquire() as con:
             await con.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -69,47 +65,40 @@ async def _try_connect_postgres():
                 created_at BIGINT NOT NULL
             );
             """)
-        print("✅ Connected to Postgres and ensured tables.")
+        print("Connected to Postgres and created/ensured tables.")
         _using_local = False
         return True
     except Exception as e:
-        print("❌ Failed to connect to Postgres (will fallback to local).")
+        print("Failed to connect to Postgres; falling back to local. Exception:")
         traceback.print_exc()
         _using_local = True
         return False
 
+def DATABASE_url_ok(dsn: str) -> bool:
+    if not dsn:
+        return False
+    # Basic check: must start with postgresql://
+    return dsn.startswith("postgresql://") or dsn.startswith("postgres://")
+
 async def _init_local():
     global _local_module
     if _local_module is None:
-        import database_local as local
-        _local_module = local
+        _local_module = importlib.import_module("database_local")
     await _local_module.init_db()
 
 async def init_db():
     """
-    Initialize DB: try Postgres first, else local.
+    Try to initialize Postgres; if fails, init local SQLite.
     """
     global _using_local
     if not _using_local:
         ok = await _try_connect_postgres()
         if ok:
             return
-    # fallback to local
     print("Using local SQLite database.")
     await _init_local()
     _using_local = True
 
-def _ensure_local_sync():
-    """
-    Helper to make sure local module is imported synchronously.
-    Used for fallback in sync contexts.
-    """
-    import importlib
-    global _local_module
-    if _local_module is None:
-        _local_module = importlib.import_module("database_local")
-
-# Helper switch to local on runtime error
 async def _switch_to_local_on_error(exc: Exception):
     global _using_local
     print("Switching to local DB due to exception:", exc)
@@ -119,7 +108,7 @@ async def _switch_to_local_on_error(exc: Exception):
 
 # ---- Settings ----
 async def set_setting(key: str, value: str):
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 await con.execute("""
@@ -134,7 +123,7 @@ async def set_setting(key: str, value: str):
     return await _local_module.set_setting(key, value)
 
 async def get_setting(key: str) -> Optional[str]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("SELECT value FROM settings WHERE key = $1;", key)
@@ -145,7 +134,7 @@ async def get_setting(key: str) -> Optional[str]:
     return await _local_module.get_setting(key)
 
 async def all_settings() -> Dict[str, str]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 rows = await con.fetch("SELECT key, value FROM settings;")
@@ -157,7 +146,7 @@ async def all_settings() -> Dict[str, str]:
 
 # ---- Auctions & Bids ----
 async def create_auction(started_by: int, start_bid: int, min_increment: int, ends_at: int) -> Dict[str, Any]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("""
@@ -172,7 +161,7 @@ async def create_auction(started_by: int, start_bid: int, min_increment: int, en
     return await _local_module.create_auction(started_by, start_bid, min_increment, ends_at)
 
 async def get_active_auction() -> Optional[Dict[str, Any]]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("""
@@ -188,7 +177,7 @@ async def get_active_auction() -> Optional[Dict[str, Any]]:
     return await _local_module.get_active_auction()
 
 async def end_auction(auction_id: int, final_price: int = None, winner_id: int = None):
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 await con.execute("""
@@ -203,7 +192,7 @@ async def end_auction(auction_id: int, final_price: int = None, winner_id: int =
     return await _local_module.end_auction(auction_id, final_price, winner_id)
 
 async def add_bid(auction_id: int, user_id: int, amount: int) -> Dict[str, Any]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("""
@@ -218,7 +207,7 @@ async def add_bid(auction_id: int, user_id: int, amount: int) -> Dict[str, Any]:
     return await _local_module.add_bid(auction_id, user_id, amount)
 
 async def get_bids_for_auction(auction_id: int) -> List[Dict[str, Any]]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 rows = await con.fetch("""
@@ -231,7 +220,7 @@ async def get_bids_for_auction(auction_id: int) -> List[Dict[str, Any]]:
     return await _local_module.get_bids_for_auction(auction_id)
 
 async def get_last_bid_by_user(auction_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("""
@@ -244,7 +233,7 @@ async def get_last_bid_by_user(auction_id: int, user_id: int) -> Optional[Dict[s
     return await _local_module.get_last_bid_by_user(auction_id, user_id)
 
 async def undo_last_bid(auction_id: int) -> Optional[Dict[str, Any]]:
-    if not _using_local:
+    if not _using_local and _pool is not None:
         try:
             async with _pool.acquire() as con:
                 row = await con.fetchrow("""
@@ -260,7 +249,6 @@ async def undo_last_bid(auction_id: int) -> Optional[Dict[str, Any]]:
     await _init_local()
     return await _local_module.undo_last_bid(auction_id)
 
-# optional: close connections
 async def close_db():
     global _pool, _local_module
     try:

@@ -19,11 +19,11 @@ async def init_db():
     if _conn:
         return
     _conn = await aiosqlite.connect(_db_path)
-    # allow access by column name
     _conn.row_factory = aiosqlite.Row
-    async with _conn.execute("""PRAGMA journal_mode=WAL;"""):
-        pass
+    # use WAL for safer concurrency
+    await _conn.execute("PRAGMA journal_mode=WAL;")
     await _create_tables()
+    await _conn.commit()
 
 async def _create_tables():
     global _conn
@@ -64,9 +64,9 @@ async def set_setting(key: str, value: str):
     global _conn
     await init_db()
     async with _lock:
+        # SQLite doesn't have "excluded" shorthand in upsert for older versions, but recent versions support it.
         await _conn.execute("""
-        INSERT INTO settings(key, value)
-        VALUES (?, ?)
+        INSERT INTO settings(key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value;
         """, (key, value))
         await _conn.commit()
@@ -93,22 +93,20 @@ async def create_auction(started_by: int, start_bid: int, min_increment: int, en
     await init_db()
     ts = int(time.time())
     async with _lock:
-        cur = await _conn.execute("""
+        await _conn.execute("""
         INSERT INTO auctions (started_by, start_bid, min_increment, status, started_at, ends_at)
         VALUES (?, ?, ?, 'OPEN', ?, ?);
         """, (started_by, start_bid, min_increment, ts, ends_at))
         await _conn.commit()
-        row = await _conn.execute("SELECT * FROM auctions ORDER BY id DESC LIMIT 1;")
-        r = await row.fetchone()
+        cur = await _conn.execute("SELECT * FROM auctions ORDER BY id DESC LIMIT 1;")
+        r = await cur.fetchone()
         return dict(r)
 
 async def get_active_auction() -> Optional[Dict[str, Any]]:
     global _conn
     await init_db()
     async with _lock:
-        cur = await _conn.execute("""
-        SELECT * FROM auctions WHERE status = 'OPEN' ORDER BY started_at DESC LIMIT 1;
-        """)
+        cur = await _conn.execute("SELECT * FROM auctions WHERE status = 'OPEN' ORDER BY started_at DESC LIMIT 1;")
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -128,23 +126,20 @@ async def add_bid(auction_id: int, user_id: int, amount: int) -> Dict[str, Any]:
     global _conn
     await init_db()
     async with _lock:
-        cur = await _conn.execute("""
+        await _conn.execute("""
         INSERT INTO bids (auction_id, user_id, amount, created_at)
         VALUES (?, ?, ?, ?);
         """, (auction_id, user_id, amount, int(time.time())))
         await _conn.commit()
-        # return inserted bid
-        cur2 = await _conn.execute("SELECT * FROM bids ORDER BY id DESC LIMIT 1;")
-        r = await cur2.fetchone()
+        cur = await _conn.execute("SELECT * FROM bids ORDER BY id DESC LIMIT 1;")
+        r = await cur.fetchone()
         return dict(r)
 
 async def get_bids_for_auction(auction_id: int) -> List[Dict[str, Any]]:
     global _conn
     await init_db()
     async with _lock:
-        cur = await _conn.execute("""
-        SELECT * FROM bids WHERE auction_id = ? ORDER BY amount DESC, created_at ASC;
-        """, (auction_id,))
+        cur = await _conn.execute("SELECT * FROM bids WHERE auction_id = ? ORDER BY amount DESC, created_at ASC;", (auction_id,))
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
@@ -152,9 +147,7 @@ async def get_last_bid_by_user(auction_id: int, user_id: int) -> Optional[Dict[s
     global _conn
     await init_db()
     async with _lock:
-        cur = await _conn.execute("""
-        SELECT * FROM bids WHERE auction_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1;
-        """, (auction_id, user_id))
+        cur = await _conn.execute("SELECT * FROM bids WHERE auction_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1;", (auction_id, user_id))
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -162,9 +155,7 @@ async def undo_last_bid(auction_id: int) -> Optional[Dict[str, Any]]:
     global _conn
     await init_db()
     async with _lock:
-        cur = await _conn.execute("""
-        SELECT * FROM bids WHERE auction_id = ? ORDER BY created_at DESC LIMIT 1;
-        """, (auction_id,))
+        cur = await _conn.execute("SELECT * FROM bids WHERE auction_id = ? ORDER BY created_at DESC LIMIT 1;", (auction_id,))
         row = await cur.fetchone()
         if not row:
             return None
