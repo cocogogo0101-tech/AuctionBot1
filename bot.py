@@ -1,21 +1,41 @@
 # bot.py
 """
-الملف الرئيسي لتشغيل البوت.
-تأكد من أن باقي الملفات (database.py, auctions.py, ...) موجودة في نفس المجلد.
-غير .env بقيمك ثم شغل: python bot.py
+Main entrypoint for AuctionBot.
+Designed to work with the project's existing modules (database.py, auctions.py, bids.py, config.py, ...).
+Reads BOT_TOKEN from environment (.env) and strips spaces/newlines to avoid invalid token errors.
+Run: python bot.py
 """
 
+import os
+import sys
+import traceback
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-import traceback
-import asyncio
 
-from config import BOT_TOKEN, DEFAULT_COMMISSION, DEFAULT_CURRENCY, COOLDOWN_SECONDS
-from database import init_db, set_setting, get_setting, all_settings, create_auction, get_active_auction
+# load dotenv early so .env values are available
+from dotenv import load_dotenv
+load_dotenv()
+
+# Read and sanitize BOT_TOKEN here (do not print the token itself)
+_RAW_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = _RAW_BOT_TOKEN.strip() if isinstance(_RAW_BOT_TOKEN, str) else ""
+
+# quick checks
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN is missing or empty. Set BOT_TOKEN in your .env or environment variables.")
+    sys.exit(1)
+
+print(f"INFO: BOT_TOKEN length = {len(BOT_TOKEN)} (not shown).")
+if "\n" in _RAW_BOT_TOKEN or "\r" in _RAW_BOT_TOKEN or " " in _RAW_BOT_TOKEN:
+    print("WARNING: BOT_TOKEN contained whitespace/newline characters — they were stripped. Ensure you copied the token exactly.")
+
+# Import project modules AFTER token validation (prevents partial startup with wrong env)
+from config import DEFAULT_COMMISSION, DEFAULT_CURRENCY, COOLDOWN_SECONDS, DEFAULT_AUCTION_DURATION_MIN, DEFAULT_MIN_INCREMENT
+from database import init_db, set_setting, get_setting, all_settings, create_auction, get_active_auction, undo_last_bid
 from auctions import AuctionView, build_auction_embed, handle_bid, end_current_auction
 from bids import parse_amount, fmt_amount
-from config import DEFAULT_AUCTION_DURATION_MIN, DEFAULT_MIN_INCREMENT
 
 # Intents
 intents = discord.Intents.default()
@@ -25,59 +45,74 @@ intents.message_content = False
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Use the built-in tree attached to the bot (avoid creating a new CommandTree)
+# Use bot.tree (do NOT create a new CommandTree)
 tree = bot.tree
 
-# --- Helper: get allowed server id (from DB) ---
+# Helper: get allowed server id from DB (or None)
 async def get_allowed_server_id() -> int | None:
-    v = await get_setting("server_id")
-    return int(v) if v else None
+    try:
+        v = await get_setting("server_id")
+        return int(v) if v else None
+    except Exception:
+        return None
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     # init DB connection and ensure tables
-    await init_db()
+    try:
+        await init_db()
+        print("Database initialized.")
+    except Exception as e:
+        print("ERROR: Failed to initialize database:", e)
+        traceback.print_exc()
 
-    # If server_id is set in settings, leave other guilds
-    server_id = await get_allowed_server_id()
-    if server_id:
-        for g in list(bot.guilds):
-            if g.id != server_id:
-                try:
-                    await g.leave()
-                    print(f"Left guild {g.id} because not allowed.")
-                except Exception as e:
-                    print("Failed to leave guild:", e)
+    # If server_id set, leave other guilds
+    try:
+        server_id = await get_allowed_server_id()
+        if server_id:
+            for g in list(bot.guilds):
+                if g.id != server_id:
+                    try:
+                        await g.leave()
+                        print(f"Left guild {g.id} because not allowed.")
+                    except Exception as e:
+                        print("Failed to leave guild:", e)
+    except Exception as e:
+        print("Warning: error while checking/leaving guilds:", e)
 
     # restore active auction panel if any
-    active = await get_active_auction()
-    if active:
-        ch_id = await get_setting("auction_channel_id")
-        currency = await get_setting("currency_name") or DEFAULT_CURRENCY
-        if ch_id:
-            try:
-                ch = bot.get_channel(int(ch_id))
-                if ch:
-                    embed = build_auction_embed(active, currency_name=currency)
-                    view = AuctionView(active["id"])
-                    await ch.send(embed=embed, view=view)
-            except Exception as e:
-                print("Failed to restore auction panel:", e)
-
-    # sync commands: prefer guild sync if allowed server is set (faster dev feedback)
     try:
+        active = await get_active_auction()
+        if active:
+            ch_id = await get_setting("auction_channel_id")
+            currency = await get_setting("currency_name") or DEFAULT_CURRENCY
+            if ch_id:
+                try:
+                    ch = bot.get_channel(int(ch_id))
+                    if ch:
+                        embed = build_auction_embed(active, currency_name=currency)
+                        view = AuctionView(active["id"])
+                        await ch.send(embed=embed, view=view)
+                        print("Restored auction panel to auction channel.")
+                except Exception as e:
+                    print("Failed to restore auction panel:", e)
+    except Exception as e:
+        print("Warning: error while restoring active auction:", e)
+
+    # sync commands: prefer guild sync if allowed server is set (faster)
+    try:
+        server_id = await get_allowed_server_id()
         if server_id:
             guild_obj = discord.Object(id=server_id)
             await tree.sync(guild=guild_obj)
             print(f"Commands synced to guild {server_id}.")
         else:
-            # global sync (may take time to propagate)
             await tree.sync()
             print("Commands synced globally.")
     except Exception as e:
         print("Failed to sync commands:", e)
+        traceback.print_exc()
 
 # -------------------------
 # CONFIG COMMANDS (English names, Arabic descriptions)
@@ -141,7 +176,7 @@ async def config_set_secret(interaction: discord.Interaction, secret: str):
 
 @tree.command(name="config_set_misc", description="تعيين العمولة واسم العملة (Commission & Currency).")
 @app_commands.describe(commission="Commission percent (e.g. 20)", currency="Display currency name (e.g. Credits)")
-async def config_set_misc(interaction: discord.Interaction, commission: int = DEFAULT_COMMISSION, currency: str = DEFAULT_CURRENCY):
+async def config_set_misc(interaction: discord.Interaction, commission: int, currency: str):
     if interaction.guild is None:
         await interaction.response.send_message("Execute this command in the server.", ephemeral=True)
         return
@@ -164,6 +199,7 @@ async def config_show(interaction: discord.Interaction):
     lines = []
     for k, v in s.items():
         lines.append(f"**{k}**: {v}")
+    # send ephemeral to the command user
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # -------------------------
@@ -246,8 +282,7 @@ async def auction_undo_last(interaction: discord.Interaction):
     if not (role_ok or interaction.user.guild_permissions.manage_guild):
         await interaction.response.send_message("You don't have permission.", ephemeral=True)
         return
-    from database import get_active_auction as db_get_active, undo_last_bid
-    active = await db_get_active()
+    active = await get_active_auction()
     if not active:
         await interaction.response.send_message("No active auction.", ephemeral=True)
         return
@@ -268,8 +303,8 @@ async def auction_reset(interaction: discord.Interaction, secret: str):
     if not active:
         await interaction.response.send_message("No active auction.", ephemeral=True)
         return
-    # force end with no winner
-    await end_current_auction(bot)  # end_current_auction will mark and log
+    # end and log via helper
+    await end_current_auction(bot)
     await interaction.response.send_message("Active auction force-ended.", ephemeral=True)
 
 # -------------------------
@@ -295,19 +330,21 @@ async def on_interaction(interaction: discord.Interaction):
                     await handle_bid(interaction, auction_id, 500_000)
                     return
                 if typ == "custom":
-                    # create modal from auctions module
+                    # import BidModal class from auctions module and present it
                     from auctions import BidModal
                     modal = BidModal(auction_id)
                     await interaction.response.send_modal(modal)
                     return
     except Exception:
         traceback.print_exc()
-    # fall back to processing other application commands
+    # let discord.py process other app commands normally
     await bot.process_application_commands(interaction)
 
 # Run
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        print("BOT_TOKEN not set in environment. Exiting.")
-    else:
+    try:
         bot.run(BOT_TOKEN)
+    except Exception as e:
+        print("Bot failed to start:", type(e).__name__, str(e))
+        traceback.print_exc()
+        sys.exit(1)
